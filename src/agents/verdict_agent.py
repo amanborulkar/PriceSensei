@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+import warnings
 from typing import Any, Optional
 
 from src.config import GEMINI_API_KEY, LLM_MODEL
@@ -13,6 +14,9 @@ from src.models.analysis import AnalysisResult, PriceCluster
 from src.models.verdict import Verdict
 
 from .base import BaseAgent, Event
+
+# Silence the SDK's deprecation FutureWarning.
+warnings.filterwarnings("ignore", category=FutureWarning, module="google")
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +39,15 @@ Rules:
 - Do NOT include any text outside the JSON."""
 
 RETRY_SUFFIX = "\n\nReturn ONLY valid JSON, no markdown."
+
+# The deprecated google-generativeai SDK does not support Gemini 3's
+# thinking_level parameter, so we don't set it. IDLE_TIMEOUT_S=120 in
+# orchestrator.py handles Gemini's default (~30s) thinking time.
 GENERATION_CONFIG: dict[str, Any] = {
-    "temperature": 0.3,
-    "max_output_tokens": 1024,  # headroom for Gemini 2.5 thinking tokens
+    "max_output_tokens": 4096,
     "response_mime_type": "application/json",
 }
+
 MAX_CLUSTERS_IN_CONTEXT = 5
 CONFIDENCE_LEVELS = {"high", "medium", "low"}
 RULE_BASED = "rule-based"
@@ -60,9 +68,6 @@ class VerdictAgent(BaseAgent):
         api_key: Optional[str] = None,
         model: Optional[str] = None,
     ) -> None:
-        """Create Sensei. The Gemini client is built lazily in ``_generate``,
-        so importing this module never requires a real key.
-        """
         super().__init__("verdict_agent", event_queue)
         self._api_key = api_key or GEMINI_API_KEY
         self._model_name = model or LLM_MODEL
@@ -173,7 +178,9 @@ class VerdictAgent(BaseAgent):
             self._model = genai.GenerativeModel(
                 self._model_name, system_instruction=SYSTEM_INSTRUCTION
             )
-        response = self._model.generate_content(prompt, generation_config=GENERATION_CONFIG)
+        response = self._model.generate_content(
+            prompt, generation_config=GENERATION_CONFIG
+        )
         try:
             return response.text
         except ValueError:

@@ -18,7 +18,7 @@ from src.models.verdict import Verdict
 
 PipelineEvent = Event
 
-IDLE_TIMEOUT_S = 30.0  # max silence from the pipeline before the stream is aborted
+IDLE_TIMEOUT_S = 120.0  # Gemini 3.8 thinking can take 60+ seconds
 
 
 def _dump(obj: Any) -> dict[str, Any]:
@@ -103,9 +103,6 @@ async def run_pipeline(
     Agents are built via the factories so tests/UI can inject mocks. Emits
     pipeline_started / pipeline_complete / pipeline_failed. Exceptions are
     re-raised after the failure event is emitted.
-
-    The queue is drained into ``result.events`` only when this function
-    created it. A caller-supplied queue belongs to the caller.
     """
     owns_queue = event_queue is None
     queue: asyncio.Queue[PipelineEvent] = (

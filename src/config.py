@@ -16,7 +16,7 @@ CREDIT_WARNING_THRESHOLD = 200
 
 # --- LLM (Verdict Agent / Sensei) ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-LLM_MODEL = "gemini-2.5-flash"
+LLM_MODEL = "gemini-3.8-flash"
 
 # --- Cache ---
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))

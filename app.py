@@ -25,7 +25,7 @@ from src.ui.components import (
 )
 
 BACKEND_URL = "http://localhost:8000"
-STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=180.0, write=10.0, pool=5.0)
+STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=10.0, pool=5.0)
 
 st.set_page_config(page_title="PriceSensei", page_icon="🥋", layout="wide")
 
@@ -44,12 +44,7 @@ def fetch_credits() -> dict[str, Any] | None:
 
 
 def stream_events(query: str, budget: float) -> Iterator[tuple[str, dict[str, Any]]]:
-    """Consume /api/stream and yield ``(event_name, data)`` tuples.
-
-    Handles SSE framing: ``event:`` sets the current event name, ``data:``
-    carries JSON, comment lines (``:``) are ignored and a blank line ends
-    the current message.
-    """
+    """Consume /api/stream and yield ``(event_name, data)`` tuples."""
     params: dict[str, Any] = {"query": query}
     if budget > 0:
         params["budget"] = budget
