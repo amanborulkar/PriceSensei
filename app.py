@@ -118,6 +118,9 @@ def main() -> None:
                                  help="Set to 0 for no budget limit.")
         submitted = st.form_submit_button("🔍 Ask Sensei", disabled=not backend_ok)
 
+    if budget == 0:
+        st.caption("💡 Tip: set a budget to see whether prices are under, near, or over your target.")
+
     if submitted:
         if not product.strip():
             st.warning("Please enter a product to search for.")
@@ -153,6 +156,8 @@ def main() -> None:
 
             if failed:
                 st.stop()
+            if st.session_state.result is None:
+                st.warning("Pipeline finished without a final result. Try again or check the backend logs.")
     elif st.session_state.events:
         with st.expander("Agent activity", expanded=False):
             render_agent_activity(st.session_state.events)
@@ -166,6 +171,8 @@ def main() -> None:
     verdict = result.get("verdict")
     analysis = result.get("analysis") or {}
     if verdict:
+        if len(str(verdict.get("recommendation", ""))) > 500:
+            st.warning("Verdict is unusually long — LLM output may be verbose.")
         render_verdict_card(verdict)
     if analysis:
         render_price_summary(analysis)

@@ -36,7 +36,6 @@ _CONFIDENCE_BADGES: dict[str, str] = {
     "low": ":red-background[🔴 Low confidence]",
 }
 
-# Events that only wrap other events or carry the full result payload.
 _SKIPPED_EVENTS = {"step_started", "step_complete", "pipeline_done"}
 
 
@@ -147,6 +146,10 @@ def _describe_event(event: dict[str, Any]) -> tuple[str, str] | None:
         return "✅", "Verdict ready"
     if etype == "verdict_fallback":
         return "⚠️", f"Using rule-based fallback: {event.get('reason', 'LLM unavailable')}"
+    if etype == "rate_limit_warning":
+        return "⚡", (
+            f"Rate limit nearly reached — {event.get('ip_remaining', '?')} left in window"
+        )
     if etype == "pipeline_complete":
         return "✅", (
             f"Done in {event.get('elapsed', 0):.1f}s "
@@ -155,7 +158,6 @@ def _describe_event(event: dict[str, Any]) -> tuple[str, str] | None:
     if etype == "pipeline_failed":
         return "❌", f"Pipeline failed: {event.get('error', 'unknown error')}"
 
-    # Unknown event: pick an emoji from the name.
     if "fail" in etype or "error" in etype:
         return "❌", etype.replace("_", " ")
     if "fallback" in etype:
@@ -176,6 +178,27 @@ def render_header() -> None:
     st.caption(APP_TAGLINE)
 
 
+def render_rate_limit_meter(rate_limit: dict[str, Any] | None) -> None:
+    """Render a compact rate-limit indicator, or nothing if info is missing."""
+    if not rate_limit:
+        return
+    ip_left = rate_limit.get("ip_remaining")
+    global_left = rate_limit.get("global_remaining")
+    window_min = int((rate_limit.get("window_seconds", 1800)) // 60)
+
+    if not isinstance(ip_left, int):
+        return
+
+    if ip_left <= 1:
+        st.warning(f"⚡ Only {ip_left} query left in this {window_min} min window")
+    else:
+        st.caption(
+            f"⚡ Queries left: {ip_left} (of {window_min} min window"
+            + (f", {global_left} global" if isinstance(global_left, int) else "")
+            + ")"
+        )
+
+
 def render_credit_meter(credits: dict[str, Any]) -> None:
     """Render a 'X / 250 credits used' badge with a progress bar."""
     used = int(credits.get("used", 0) or 0)
@@ -184,7 +207,11 @@ def render_credit_meter(credits: dict[str, Any]) -> None:
     st.progress(min(1.0, used / limit) if limit else 0.0)
     hits = credits.get("cache_hits", 0)
     misses = credits.get("cache_misses", 0)
-    st.caption(f"{credits.get('remaining', max(limit - used, 0))} remaining · cache {hits} hits / {misses} misses")
+    st.caption(
+        f"{credits.get('remaining', max(limit - used, 0))} remaining · "
+        f"cache {hits} hits / {misses} misses"
+    )
+    render_rate_limit_meter(credits.get("rate_limit"))
 
 
 def render_agent_activity(events: list[dict[str, Any]]) -> None:
@@ -211,8 +238,13 @@ def render_verdict_card(verdict: dict[str, Any]) -> None:
         st.subheader("🥋 Sensei's Verdict")
         st.markdown(f"## {_esc(verdict.get('recommendation', 'No recommendation'))}")
 
-        confidence = str(verdict.get("confidence", "")).lower()
-        st.markdown(_CONFIDENCE_BADGES.get(confidence, f":gray-background[{confidence or 'unknown'} confidence]"))
+        raw_confidence = verdict.get("confidence")
+        confidence = str(raw_confidence).lower()
+        if confidence in _CONFIDENCE_BADGES:
+            st.markdown(_CONFIDENCE_BADGES[confidence])
+        else:
+            shown = str(raw_confidence).replace("]", ")") if raw_confidence not in (None, "") else "unknown"
+            st.markdown(f":gray-background[{shown}]")
 
         action = verdict.get("suggested_action")
         if action:
@@ -224,7 +256,10 @@ def render_verdict_card(verdict: dict[str, Any]) -> None:
             extra = f" · Est. savings {_fmt_price(savings)}" if savings else ""
             st.markdown(f"Price to pay: **{_fmt_price(price)}**{extra}")
 
-        for reason in verdict.get("reasoning") or []:
+        reasoning = verdict.get("reasoning")
+        if not isinstance(reasoning, list):
+            reasoning = []
+        for reason in reasoning:
             st.markdown(f"- {_esc(reason)}")
 
         model = verdict.get("model_used")
@@ -242,12 +277,7 @@ def render_price_summary(analysis: dict[str, Any]) -> None:
 
 
 def render_clusters(analysis: dict[str, Any]) -> None:
-    """Render each cluster (sorted by min price) with its product table.
-
-    The backend's cluster dict only guarantees ``best_deal``. If a cluster
-    also carries a ``products`` list, all of them are shown; otherwise only
-    the best deal row is shown alongside the cluster's price stats.
-    """
+    """Render each cluster (sorted by min price) with its product table."""
     clusters = sorted(
         analysis.get("clusters") or [],
         key=lambda c: c.get("min_price") if isinstance(c.get("min_price"), (int, float)) else float("inf"),
@@ -258,30 +288,34 @@ def render_clusters(analysis: dict[str, Any]) -> None:
 
     st.subheader("Product Clusters")
     for cluster in clusters:
-        title = _esc(cluster.get("representative_title", "Untitled cluster"))
-        badge = render_deal_flag_badge(str(cluster.get("flag", "")))
-        with st.container(border=True):
-            st.markdown(f"**{title}** &nbsp; {badge}")
-            st.caption(
-                f"{cluster.get('listings_count', 0)} listings · "
-                f"{_fmt_price(cluster.get('min_price'))} – {_fmt_price(cluster.get('max_price'))} · "
-                f"median {_fmt_price(cluster.get('median_price'))} · "
-                f"saves {_fmt_price(cluster.get('savings_vs_median'))} vs median"
-            )
-
-            best = cluster.get("best_deal") or {}
-            products = cluster.get("products") or ([best] if best else [])
-            rows = [
-                _product_row(
-                    p,
-                    is_best=bool(best) and p.get("link") == best.get("link") and p.get("price") == best.get("price"),
+        try:
+            title = _esc(cluster.get("representative_title", "Untitled cluster"))
+            badge = render_deal_flag_badge(str(cluster.get("flag", "")))
+            with st.container(border=True):
+                st.markdown(f"**{title}** &nbsp; {badge}")
+                st.caption(
+                    f"{cluster.get('listings_count', 0)} listings · "
+                    f"{_fmt_price(cluster.get('min_price'))} – {_fmt_price(cluster.get('max_price'))} · "
+                    f"median {_fmt_price(cluster.get('median_price'))} · "
+                    f"saves {_fmt_price(cluster.get('savings_vs_median'))} vs median"
                 )
-                for p in sorted(products, key=lambda p: p.get("price") if isinstance(p.get("price"), (int, float)) else float("inf"))
-            ]
-            if rows:
-                _show_table(rows)
-            if best.get("link"):
-                st.link_button("🏆 View best deal", best["link"])
+
+                best = cluster.get("best_deal") or {}
+                products = cluster.get("products") or ([best] if best else [])
+                rows = [
+                    _product_row(
+                        p,
+                        is_best=bool(best) and p.get("link") == best.get("link") and p.get("price") == best.get("price"),
+                    )
+                    for p in sorted(products, key=lambda p: p.get("price") if isinstance(p.get("price"), (int, float)) else float("inf"))
+                ]
+                if rows:
+                    _show_table(rows)
+                if best.get("link"):
+                    st.link_button("🏆 View best deal", best["link"])
+        except Exception as e:  # noqa: BLE001 - one bad cluster must not break the page
+            st.error(f"Could not render cluster: {e}")
+            continue
 
 
 def render_products_table(products: list[dict[str, Any]]) -> None:
