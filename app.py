@@ -27,7 +27,12 @@ from src.ui.components import (
 BACKEND_URL = "http://localhost:8000"
 STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=10.0, pool=5.0)
 
-st.set_page_config(page_title="PriceSensei", page_icon="🥋", layout="wide")
+st.set_page_config(
+    page_title="PriceSensei",
+    page_icon="🥋",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +94,7 @@ def init_state() -> None:
 def main() -> None:
     """Render the PriceSensei page."""
     init_state()
+    # Must run first: injects the global stylesheet every other renderer relies on.
     render_header()
 
     # Sidebar
@@ -127,6 +133,10 @@ def main() -> None:
             activity_slot = st.empty()
             events: list[dict[str, Any]] = st.session_state.events
             failed = False
+
+            # Show the three agent cards in their "Waiting" state straight away.
+            with activity_slot.container():
+                render_agent_activity(events)
 
             try:
                 for name, data in stream_events(product.strip(), float(budget)):
