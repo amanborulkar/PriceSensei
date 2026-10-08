@@ -123,6 +123,9 @@ async def run_pipeline(
         analysis = await analyst.run(query, products, reference_price=user_budget)
         verdict = await sensei.run(analysis, user_budget=user_budget)
 
+        # Use the analysis's filtered view for the final result (UI display)
+        final_products = analysis.filtered_products or products
+
         elapsed = time.perf_counter() - start
         await orchestrator.emit(
             "pipeline_complete",
@@ -147,7 +150,7 @@ async def run_pipeline(
 
     return PipelineResult(
         query=query,
-        products=products,
+        products=final_products,
         analysis=analysis,
         verdict=verdict,
         credits=_credits(search),

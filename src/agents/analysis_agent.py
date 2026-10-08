@@ -1,8 +1,9 @@
-"""Analyst: removes price outliers, clusters equivalent listings, scores deals."""
+"""Analyst: filters irrelevant listings, removes price outliers, clusters equivalent listings, scores deals."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import statistics
 from typing import Optional
@@ -14,34 +15,38 @@ from src.models.product import Product
 
 from .base import BaseAgent, Event
 
-# Words that don't affect product identity (brands, colors, filler).
+logger = logging.getLogger(__name__)
+
 _STOPWORDS = frozenset({
     "apple", "samsung", "google", "oneplus", "xiaomi", "redmi", "realme",
     "new", "original", "brand", "sealed", "latest", "the", "a", "an", "for",
     "with", "and",
     "black", "white", "blue", "silver", "gold", "gray", "grey", "green",
     "red", "pink", "purple", "yellow", "titanium", "midnight", "starlight",
-    "natural", "desert", "onyx", "marble", "cobalt", "violet",
+    "natural", "desert",
 })
 
-# Model markers that DO matter.
 _MODEL_MARKERS = frozenset({
     "pro", "plus", "max", "ultra", "mini", "lite", "air", "fe",
 })
 
-# Connectivity/tech markers that don't distinguish products in practice.
-_NOISE_MARKERS = frozenset({"5g", "4g", "3g", "lte", "wifi", "wlan", "nfc"})
+_UNIT_SPLIT = re.compile(r"(\d+)\s*(gb|tb|mb|inch|mm|cm|kg|g)\b", re.IGNORECASE)
 
-# Split a number immediately followed by a unit suffix: "128gb" -> "128 gb".
-# Note: bare "g" is intentionally excluded — it would match "5g" (fifth-gen)
-# and incorrectly split it into "5 g".
-_UNIT_SPLIT = re.compile(r"(\d+)\s*(gb|tb|mb|inch|mm|cm|kg)\b", re.IGNORECASE)
-
-# Bracket characters normalized to spaces.
-_BRACKETS = re.compile(r"[\(\)\[\]\{\}]")
-
-# Connectivity markers that should be dropped from the title entirely.
-_CONNECTIVITY = re.compile(r"\b(5g|4g|3g|lte|wifi|wlan|nfc)\b", re.IGNORECASE)
+# Matched against text that has already been through _normalize_for_match
+# (lowercase, punctuation -> spaces, units split as "128 gb").
+# NOTE: "glass" and "tempered" are intentionally NOT standalone terms to avoid
+# dropping listings that mention "Gorilla Glass". Only "tempered glass" and
+# "screen glass" as phrases count as accessories.
+_ACCESSORY_RE = re.compile(
+    r"\b(case|cover|charger|cable|protector|screen guard|adapter|stand|holder|"
+    r"strap|pouch|sleeve|skin|tempered glass|screen glass|glass protector|"
+    r"earbud|headphone|watch band)s?\b"
+)
+_CONDITION_RE = re.compile(
+    r"\b(renewed|refur\w*|pre ?owned|used|second ?hand|fair|good|open ?box)\b"
+)
+_STORAGE_UNITS = frozenset({"gb", "tb", "mb"})
+_MAX_LOGGED_DROPS = 5
 
 
 class AnalysisAgent(BaseAgent):
@@ -52,16 +57,10 @@ class AnalysisAgent(BaseAgent):
         event_queue: asyncio.Queue[Event],
         fuzzy_threshold: int = 85,
     ) -> None:
-        """Create Analyst.
-
-        Args:
-            event_queue: Shared queue drained by the SSE consumer.
-            fuzzy_threshold: Minimum token_set_ratio (0-100) for two titles
-                to be treated as the same product, given matching numeric
-                tokens.
-        """
         super().__init__("analysis_agent", event_queue)
         self._fuzzy_threshold = fuzzy_threshold
+        # Set by _filter_relevant when it fell back to the unfiltered list.
+        self._relevance_skipped: bool = False
 
     async def run(
         self,
@@ -69,31 +68,31 @@ class AnalysisAgent(BaseAgent):
         products: list[Product],
         reference_price: Optional[float] = None,
     ) -> AnalysisResult:
-        """Analyse a product list and return clustered price statistics.
-
-        Never raises on empty input: emits ``analysis_empty`` and returns a
-        zeroed result instead.
-        """
         await self.emit("analysis_started", query=query, product_count=len(products))
 
         if not products:
             await self.emit("analysis_empty", query=query)
             return AnalysisResult(
-                query=query,
-                total_products=0,
-                total_clusters=0,
-                clusters=[],
-                global_min_price=0.0,
-                global_median_price=0.0,
-                global_max_price=0.0,
-                best_overall_deal=None,
-                reference_price=reference_price,
-                vs_reference=None,
-                outliers_removed=0,
+                query=query, total_products=0, total_clusters=0, clusters=[],
+                global_min_price=0.0, global_median_price=0.0, global_max_price=0.0,
+                best_overall_deal=None, reference_price=reference_price,
+                vs_reference=None, outliers_removed=0,
             )
 
-        kept = self._remove_outliers(products)
-        removed = len(products) - len(kept)
+        filtered = self._filter_relevant(query, products)
+        if self._relevance_skipped:
+            await self.emit("relevance_filter_skipped", reason="no_products_left")
+        elif len(filtered) < len(products):
+            kept_ids = {id(p) for p in filtered}
+            await self.emit(
+                "relevance_filtered",
+                kept=len(filtered),
+                dropped=len(products) - len(filtered),
+                example_dropped=[p.title for p in products if id(p) not in kept_ids][:3],
+            )
+
+        kept = self._remove_outliers(filtered)
+        removed = len(filtered) - len(kept)
         if removed:
             await self.emit("outliers_flagged", removed=removed, kept=len(kept))
 
@@ -119,37 +118,179 @@ class AnalysisAgent(BaseAgent):
                 vs_reference = "near"
             await self.emit(
                 "reference_comparison",
-                reference=reference_price,
-                min_price=g_min,
-                verdict=vs_reference,
+                reference=reference_price, min_price=g_min, verdict=vs_reference,
             )
 
         result = AnalysisResult(
-            query=query,
-            total_products=len(kept),
-            total_clusters=len(clusters),
-            clusters=clusters,
-            global_min_price=g_min,
-            global_median_price=g_median,
-            global_max_price=g_max,
-            best_overall_deal=best_overall,
-            reference_price=reference_price,
-            vs_reference=vs_reference,
+            query=query, total_products=len(kept), total_clusters=len(clusters),
+            clusters=clusters, global_min_price=g_min, global_median_price=g_median,
+            global_max_price=g_max, best_overall_deal=best_overall,
+            reference_price=reference_price, vs_reference=vs_reference,
             outliers_removed=removed,
+            filtered_products=kept,
         )
         await self.emit(
-            "analysis_complete",
-            query=query,
-            clusters=len(clusters),
-            global_min=g_min,
-            global_median=g_median,
-            best_deal_price=best_overall.price,
+            "analysis_complete", query=query, clusters=len(clusters),
+            global_min=g_min, global_median=g_median, best_deal_price=best_overall.price,
         )
         return result
 
+    # ------------------------------------------------------------------
+    # Relevance filtering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Lowercase, split units ("128GB" -> "128 gb"), strip punctuation."""
+        text = text.lower()
+        text = _UNIT_SPLIT.sub(r"\1 \2", text)
+        text = re.sub(r"[^\w\s]", " ", text)
+        return " ".join(text.split())
+
+    @staticmethod
+    def _canonical_term(term: str) -> str:
+        """Canonical key for an accessory/condition term (spacing/variants folded)."""
+        key = term.replace(" ", "")
+        return "refurbished" if key.startswith("refur") else key
+
+    @classmethod
+    def _flag_terms(cls, normalized: str) -> tuple[frozenset[str], frozenset[str]]:
+        """Return (accessory_terms, condition_terms) found in normalized text."""
+        accessories = frozenset(
+            cls._canonical_term(m.group(1)) for m in _ACCESSORY_RE.finditer(normalized)
+        )
+        conditions = frozenset(
+            cls._canonical_term(m.group(1)) for m in _CONDITION_RE.finditer(normalized)
+        )
+        return accessories, conditions
+
+    @classmethod
+    def _query_tokens(cls, normalized_query: str) -> list[tuple[str, ...]]:
+        """Extract meaningful query tokens, each as a tuple of accepted variants.
+
+        Accessory/condition words and stopwords are ignored. A token is kept
+        if it is longer than 2 chars or contains a digit (so "15" survives).
+        "128GB" yields the variants ("128gb", "128 gb", "128").
+        """
+        text = _ACCESSORY_RE.sub(" ", normalized_query)
+        text = _CONDITION_RE.sub(" ", text)
+        text = _UNIT_SPLIT.sub(r"\1\2", text)  # "128 gb" -> "128gb"
+
+        tokens: list[tuple[str, ...]] = []
+        seen: set[str] = set()
+        for tok in text.split():
+            if tok in _STOPWORDS or tok in seen:
+                continue
+            if len(tok) <= 2 and not any(c.isdigit() for c in tok):
+                continue
+            seen.add(tok)
+            variants = [tok]
+            m = re.fullmatch(r"(\d+)(gb|tb|mb|inch|mm|cm|kg|g)", tok)
+            if m:
+                number, unit = m.groups()
+                variants.append(f"{number} {unit}")
+                if unit in _STORAGE_UNITS:
+                    variants.append(number)
+            tokens.append(tuple(variants))
+        return tokens
+
+    @staticmethod
+    def _contains_term(haystack: str, term: str) -> bool:
+        """Substring match for words; boundary-aware match for numeric terms."""
+        if any(c.isdigit() for c in term):
+            pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+            return re.search(pattern, haystack) is not None
+        return term in haystack
+
+    def _relevance_drop_reason(
+        self,
+        title: str,
+        allowed_terms: frozenset[str],
+        token_variants: list[tuple[str, ...]],
+        required_matches: int,
+    ) -> Optional[str]:
+        """Return why a title should be dropped, or None if it is relevant."""
+        normalized = self._normalize_for_match(title)
+        accessories, conditions = self._flag_terms(normalized)
+
+        bad_accessories = accessories - allowed_terms
+        if bad_accessories:
+            return f"accessory term '{sorted(bad_accessories)[0]}'"
+
+        bad_conditions = conditions - allowed_terms
+        if bad_conditions:
+            return f"condition term '{sorted(bad_conditions)[0]}'"
+
+        if token_variants:
+            matched = sum(
+                1
+                for variants in token_variants
+                if any(self._contains_term(normalized, v) for v in variants)
+            )
+            if matched < required_matches:
+                return f"query tokens matched {matched}/{len(token_variants)}"
+        return None
+
+    def _filter_relevant(self, query: str, products: list[Product]) -> list[Product]:
+        """Keep only products whose title plausibly matches the query.
+
+        Rules (all must pass to keep a product):
+          1. No accessory terms in the title, unless the query contains them.
+          2. No condition terms in the title, unless the query contains them.
+          3. Every meaningful query token must appear in the title. With more
+             than 3 meaningful tokens, 80% must match. Skipped when the query
+             has no meaningful tokens.
+
+        If every product would be dropped, the original list is returned
+        unchanged and ``self._relevance_skipped`` is set so run() can emit
+        ``relevance_filter_skipped``.
+        """
+        self._relevance_skipped = False
+        if not products:
+            return []
+
+        normalized_query = self._normalize_for_match(query)
+        q_accessories, q_conditions = self._flag_terms(normalized_query)
+        allowed_terms = q_accessories | q_conditions
+
+        token_variants = self._query_tokens(normalized_query)
+        n = len(token_variants)
+        required = n if n <= 3 else (4 * n + 4) // 5  # ceil(0.8 * n)
+
+        kept: list[Product] = []
+        dropped: list[tuple[str, str]] = []
+        for product in products:
+            reason = self._relevance_drop_reason(
+                product.title, allowed_terms, token_variants, required
+            )
+            if reason is None:
+                kept.append(product)
+            else:
+                dropped.append((product.title, reason))
+
+        if not kept:
+            self._relevance_skipped = True
+            logger.info(
+                "Relevance filter would drop all %d products for query %r; skipping",
+                len(products), query,
+            )
+            return list(products)
+
+        for title, reason in dropped[:_MAX_LOGGED_DROPS]:
+            logger.info("Relevance filter dropped %r (%s)", title, reason)
+        if len(dropped) > _MAX_LOGGED_DROPS:
+            logger.info(
+                "Relevance filter dropped %d more products",
+                len(dropped) - _MAX_LOGGED_DROPS,
+            )
+        return kept
+
+    # ------------------------------------------------------------------
+    # Outliers, clustering, scoring
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _remove_outliers(products: list[Product]) -> list[Product]:
-        """Drop listings outside the 1.5*IQR fences (Tukey's rule)."""
         if len(products) < 4:
             return list(products)
         q1, _, q3 = statistics.quantiles(
@@ -163,55 +304,28 @@ class AnalysisAgent(BaseAgent):
 
     @classmethod
     def _normalize_title(cls, title: str) -> str:
-        """Lowercase, split units, drop filler words, and strip punctuation.
-
-        Examples:
-          "Apple iPhone 15 128GB Black"     -> "iphone 15 128 gb"
-          "iPhone 15 128 GB (Blue)"         -> "iphone 15 128 gb"
-          "Apple iPhone 15 (128GB) - Pink"  -> "iphone 15 128 gb"
-          "Samsung Galaxy S24 5G 256GB"     -> "galaxy s24 256 gb"
-        """
         text = title.lower()
-        # Drop connectivity markers BEFORE unit splitting, so "5g" doesn't
-        # become "5 g" (the unit regex would otherwise treat trailing "g" as grams).
-        text = _CONNECTIVITY.sub(" ", text)
-        text = _BRACKETS.sub(" ", text)          # "(128GB)" -> " 128GB "
-        text = _UNIT_SPLIT.sub(r"\1 \2", text)   # "128gb" -> "128 gb"
-        text = re.sub(r"[^\w\s]", " ", text)     # strip remaining punctuation
+        text = _UNIT_SPLIT.sub(r"\1 \2", text)
+        text = re.sub(r"[^\w\s]", " ", text)
         words = [w for w in text.split() if w not in _STOPWORDS]
         return " ".join(words)
 
-    @classmethod
-    def _signature(cls, title: str) -> frozenset[str]:
-        """Return the numeric + model-marker tokens that must match exactly.
-
-        Computed on the *normalized* title, so units are already split.
-        Connectivity markers like 5G are dropped.
-        """
-        normalized = cls._normalize_title(title)
+    @staticmethod
+    def _signature(title: str) -> frozenset[str]:
+        normalized = AnalysisAgent._normalize_title(title)
         sig: set[str] = set()
         for tok in normalized.split():
-            if tok in _NOISE_MARKERS:
-                continue
             if any(c.isdigit() for c in tok) or tok in _MODEL_MARKERS:
                 sig.add(tok)
         return frozenset(sig)
 
     def _cluster(self, products: list[Product]) -> list[list[Product]]:
-        """Greedy clustering on normalized titles + signature guard.
-
-        Two titles cluster only if:
-          1. Their signatures (numeric + model markers) match exactly
-          2. AND token_set_ratio on normalized titles >= self._fuzzy_threshold
-        """
         reps: list[str] = []
         sigs: list[frozenset[str]] = []
         groups: list[list[Product]] = []
-
         for product in products:
             normalized = self._normalize_title(product.title)
             sig = self._signature(product.title)
-
             for i, rep in enumerate(reps):
                 if sig != sigs[i]:
                     continue
@@ -226,19 +340,16 @@ class AnalysisAgent(BaseAgent):
 
     @staticmethod
     def _build_cluster(group: list[Product]) -> PriceCluster:
-        """Compute price statistics and the deal flag for one cluster."""
         prices = [p.price for p in group]
         low, high = min(prices), max(prices)
         median = statistics.median(prices)
         savings = low - median
-
         if len(group) >= 3 and savings < -0.05 * median:
             flag = "BEST_DEAL"
         elif low > 1.15 * median:
             flag = "OVERPRICED"
         else:
             flag = "FAIR_PRICE"
-
         return PriceCluster(
             representative_title=group[0].title,
             products=group,

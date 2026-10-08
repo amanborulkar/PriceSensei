@@ -1,8 +1,7 @@
 """Data models produced by the AnalysisAgent."""
 
 from __future__ import annotations
-
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 from src.models.product import Product
@@ -57,6 +56,7 @@ class AnalysisResult:
     reference_price: Optional[float]
     vs_reference: Optional[str]  # "under" | "near" | "over" | None
     outliers_removed: int
+    filtered_products: list[Product] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-friendly dict (nested clusters and products included)."""
@@ -65,6 +65,7 @@ class AnalysisResult:
         data["best_overall_deal"] = (
             self.best_overall_deal.to_dict() if self.best_overall_deal else None
         )
+        data["filtered_products"] = [p.to_dict() for p in self.filtered_products]
         return data
 
     @classmethod
@@ -75,5 +76,8 @@ class AnalysisResult:
             **data,
             "clusters": [PriceCluster.from_dict(c) for c in data["clusters"]],
             "best_overall_deal": Product.from_dict(best) if best else None,
+            "filtered_products": [
+                Product.from_dict(p) for p in data.get("filtered_products", [])
+            ],
         }
         return cls(**kwargs)
